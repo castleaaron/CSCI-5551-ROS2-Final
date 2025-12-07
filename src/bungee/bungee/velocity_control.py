@@ -12,10 +12,10 @@ from px4_msgs.msg import VehicleStatus
 from px4_msgs.msg import VehicleAttitude
 from px4_msgs.msg import VehicleCommand
 from px4_msgs.msg import VehicleLocalPosition
-from bungee_msgs.msg import BoolVector3
 from geometry_msgs.msg import Twist, Vector3
 from math import pi
 from std_msgs.msg import Bool
+from visualization_msgs.msg import Marker
 
 
 class OffboardControl(Node):
@@ -68,16 +68,24 @@ class OffboardControl(Node):
             qos_profile)
         
         self.pos_sub = self.create_subscription(
-            BoolVector3,
+            Vector3,
             '/controller_pos',
             self.follow_pos_callback,
             qos_profile)
+        
+        self.follow_mode_sub = self.create_subscription(
+            Bool,
+            '/follow_mode_toggle',
+            self.follow_mode_callback,
+            qos_profile
+        )
 
         #Create publishers
         self.publisher_offboard_mode = self.create_publisher(OffboardControlMode, '/fmu/in/offboard_control_mode', qos_profile)
         self.publisher_velocity = self.create_publisher(Twist, '/fmu/in/setpoint_velocity/cmd_vel_unstamped', qos_profile)
         self.publisher_trajectory = self.create_publisher(TrajectorySetpoint, '/fmu/in/trajectory_setpoint', qos_profile)
         self.vehicle_command_publisher_ = self.create_publisher(VehicleCommand, "/fmu/in/vehicle_command", 10)
+        self.controller_marker_pub = self.create_publisher(Marker, '/vr_controller_marker', 10)
 
         
         #creates callback function for the arm timer
@@ -107,7 +115,43 @@ class OffboardControl(Node):
         self.lock = Vector3()
         self.x = 0
         self.y = 0
-        self.z = 0    
+        self.z = 0
+        self.follow_mode = False
+        self.controller_pos = []
+        self.first_time = False
+        self.initial_pos = None
+
+        self.orbit_angular_vel = 0.005
+        self.orbit_radius = 5
+        self.orbit_x_bar = 0.0
+        self.orbit_y_bar = 0.0
+        self.theta = 0.0
+
+        self.counter = 0
+
+
+
+    def publish_controller_marker(self, position):
+        marker = Marker()
+        marker.header.frame_id = 'map'  # or 'world' depending on your TF
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = 'vr_controller'
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = position[0]
+        marker.pose.position.y = -position[1]
+        marker.pose.position.z = -position[2]
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.2  # 5cm diameter
+        marker.scale.y = 0.2
+        marker.scale.z = 0.2
+        marker.color.r = 1.0
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+        self.controller_marker_pub.publish(marker)
+
 
 
 
@@ -123,16 +167,59 @@ class OffboardControl(Node):
             self.lock.y = self.y
             self.lock.z = self.z
 
-    def follow_pos_callback(self, msg):
-        self.lock_msg = msg.flag
-        if msg.flag: # start follow mode
-            # what we want to do is update the home position in relation to the controller
-            controller_pos = msg.vector
-            self.lock.x = controller_pos.z
-            self.lock.y = controller_pos.x
-            self.lock.z = controller_pos.y - 5
+            self.publish_controller_marker([self.lock.x, self.lock.y, self.lock.z])
 
-            self.get_logger().info(f"{self.lock.x} - {self.lock.y} - {self.lock.z}")
+    def follow_mode_callback(self, msg):
+        self.follow_mode = msg.data
+        self.first_time = True
+        
+
+    def follow_pos_callback(self, msg):
+        # what we want to do is update the home position in relation to the controller
+        controller_pos = [msg.x, msg.y, msg.z]
+
+        if self.first_time:
+            self.initial_pos = controller_pos
+            self.first_time = False
+
+            self.orbit_x_bar = self.initial_pos[0] - self.x
+            self.orbit_y_bar = self.initial_pos[1] - self.y
+
+            self.theta = np.arctan(self.orbit_y_bar / self.orbit_x_bar)
+
+        self.theta = self.theta + (self.orbit_angular_vel * self.yaw)
+        
+        orbit_x = controller_pos[0] + (self.orbit_radius * np.cos(self.theta))
+        orbit_y = controller_pos[1] + (self.orbit_radius * np.sin(self.theta))
+
+
+        offboard_msg = OffboardControlMode()
+        offboard_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+        offboard_msg.position = False
+        offboard_msg.velocity = True
+        offboard_msg.acceleration = False
+        self.publisher_offboard_mode.publish(offboard_msg)            
+
+        trajectory_msg = TrajectorySetpoint()
+        trajectory_msg.timestamp = int(Clock().now().nanoseconds / 1000)
+
+        trajectory_msg.velocity[0] = float('nan')
+        trajectory_msg.velocity[1] = float('nan')
+        trajectory_msg.velocity[2] = float('nan')
+        trajectory_msg.position[0] = orbit_x
+        trajectory_msg.position[1] = orbit_y
+        trajectory_msg.position[2] = controller_pos[2]
+        trajectory_msg.acceleration[0] = float('nan')
+        trajectory_msg.acceleration[1] = float('nan')
+        trajectory_msg.acceleration[2] = float('nan')
+        trajectory_msg.yaw = self.theta + np.pi
+        trajectory_msg.yawspeed = float('nan')
+
+
+        self.publisher_trajectory.publish(trajectory_msg)
+
+        self.publish_controller_marker([controller_pos[0], controller_pos[1], controller_pos[2]])
+
 
 
     
@@ -260,11 +347,18 @@ class OffboardControl(Node):
             self.velocity.y = msg.linear.x
         else:
             self.velocity.y = 0.0
+
+        joystick_dz = 0.3
+        if abs(msg.linear.z) > joystick_dz:
+            self.velocity.z = -msg.linear.z
+        else:
+            self.velocity.z = 0.0
         
-        # Z (FLU) is -Z (NED)
-        self.velocity.z = -msg.linear.z
-        # A conversion for angular z is done in the attitude_callback function(it's the '-' in front of self.trueYaw)
-        self.yaw = msg.angular.z
+        if abs(msg.angular.z) > joystick_dz:
+            self.yaw = msg.angular.z
+        else:
+            self.yaw = 0.0
+        
 
     #receives current trajectory values from drone and grabs the yaw value of the orientation
     def attitude_callback(self, msg):
@@ -278,7 +372,7 @@ class OffboardControl(Node):
 
     #publishes offboard control modes and velocity as trajectory setpoints
     def cmdloop_callback(self):
-        if(self.offboardMode == True):
+        if(self.offboardMode == True and self.follow_mode == False):
             # Publish offboard control modes
             offboard_msg = OffboardControlMode()
             offboard_msg.timestamp = int(Clock().now().nanoseconds / 1000)
@@ -321,21 +415,15 @@ class OffboardControl(Node):
             # self.get_logger().info(f"Col Angle: {col_angle}")
             # self.get_logger().info(f"vel Angle: {vel_angle}")
             if self.lock_msg:
-                
                 in_bounds = np.sqrt(pow(x_bar,2) + pow(y_bar,2)) < radius
                 
                 if not in_bounds:
-                    
-
                     trajectory_msg.velocity[0] = float('nan')
                     trajectory_msg.velocity[1] = float('nan')
                     trajectory_msg.velocity[2] = float('nan')
                     trajectory_msg.position[0] = self.x
                     trajectory_msg.position[1] = self.y
                     trajectory_msg.position[2] = self.lock.z
-                    trajectory_msg.acceleration[0] = float('nan')
-                    trajectory_msg.acceleration[1] = float('nan')
-                    trajectory_msg.acceleration[2] = float('nan')
                     trajectory_msg.yaw = float('nan')
                     trajectory_msg.yawspeed = 0.0
                     if (vel_angle > col_angle + 90) or (vel_angle < col_angle - 90):
@@ -345,9 +433,6 @@ class OffboardControl(Node):
                         trajectory_msg.position[0] = float('nan')
                         trajectory_msg.position[1] = float('nan')
                         trajectory_msg.position[2] = float('nan')
-                        trajectory_msg.acceleration[0] = float('nan')
-                        trajectory_msg.acceleration[1] = float('nan')
-                        trajectory_msg.acceleration[2] = float('nan')
                         trajectory_msg.yaw = float('nan')
                         trajectory_msg.yawspeed = self.yaw
 
@@ -358,14 +443,26 @@ class OffboardControl(Node):
                     trajectory_msg.position[0] = self.lock.x
                     trajectory_msg.position[1] = self.lock.y
                     trajectory_msg.position[2] = self.lock.z
-                    trajectory_msg.acceleration[0] = float('nan')
-                    trajectory_msg.acceleration[1] = float('nan')
-                    trajectory_msg.acceleration[2] = float('nan')
                     trajectory_msg.yaw = float('nan')
                     trajectory_msg.yawspeed = 0.0
                 else:
                     trajectory_msg.velocity[2] = 0.0
-            
+
+                if self.counter >= 10 and not (abs(self.velocity.x)==0.0) and (abs(self.velocity.y)==0.0) and (abs(self.yaw)==0.0):
+                    trajectory_msg.velocity[0] = float('nan')
+                    trajectory_msg.velocity[1] = float('nan')
+                    trajectory_msg.velocity[2] = float('nan')
+                    trajectory_msg.position[0] = self.x
+                    trajectory_msg.position[1] = self.y
+                    trajectory_msg.position[2] = self.lock.z
+                    trajectory_msg.yaw = float('nan')
+                    trajectory_msg.yawspeed = 0.0
+
+                
+                self.counter += 1
+                self.counter %= 10
+                
+
             self.publisher_trajectory.publish(trajectory_msg)
 
 

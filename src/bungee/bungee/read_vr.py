@@ -7,12 +7,11 @@ import time
 import rclpy
 from rclpy.node import Node
 from tf_transformations import euler_from_quaternion
-from bungee_msgs.msg import BoolVector3
+# from bungee_msgs.msg import BoolVector3
 
-from geometry_msgs.msg import Quaternion, Twist
+from geometry_msgs.msg import Quaternion, Twist, Vector3
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 from std_msgs.msg import Bool
-from visualization_msgs.msg import Marker
 
 # publish to /offboard_velocity_cmd
 class OpenVRPublisher(Node):
@@ -31,7 +30,6 @@ class OpenVRPublisher(Node):
             )
         
 
-        self.controller_marker_pub = self.create_publisher(Marker, '/vr_controller_marker', 10)
 
 
         self.velocity_pub = self.create_publisher(Twist, '/offboard_velocity_cmd', qos_profile)
@@ -44,7 +42,8 @@ class OpenVRPublisher(Node):
 
 
         self.follow_toggle = False
-        self.followpoint_pub = self.create_publisher(BoolVector3, '/controller_pos', qos_profile)
+        self.followpoint_pub = self.create_publisher(Vector3, '/controller_pos', qos_profile)
+        self.follow_mode_pub = self.create_publisher(Bool, '/follow_mode_toggle', qos_profile)
 
         self.timer = self.create_timer(1.0 / 60.0, self.timer_callback)
         self.poses = []
@@ -61,35 +60,10 @@ class OpenVRPublisher(Node):
         self.last_r3_state = False
         self.last_a_state = False
         self.last_b_state = False
-        
-        # Double-click detection with delayed single-click action
-        self.last_click_time = 0.0
-        self.double_click_threshold = 0.3  # 300ms window for double-click
-        self.pending_single_click = False
-        self.pending_click_timer = None
+        self.last_trigger_state = False
+    
 
     
-    def publish_controller_marker(self, position):
-        marker = Marker()
-        marker.header.frame_id = 'map'  # or 'world' depending on your TF
-        marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = 'vr_controller'
-        marker.id = 0
-        marker.type = Marker.SPHERE
-        marker.action = Marker.ADD
-        marker.pose.position.x = position[2]
-        marker.pose.position.y = position[0]
-        marker.pose.position.z = position[1]
-        marker.pose.orientation.w = 1.0
-        marker.scale.x = 0.05  # 5cm diameter
-        marker.scale.y = 0.05
-        marker.scale.z = 0.05
-        marker.color.r = 1.0
-        marker.color.g = 0.0
-        marker.color.b = 0.0
-        marker.color.a = 1.0
-        self.controller_marker_pub.publish(marker)
-
 
     def get_right_controller_index(self):
         for i in range(openvr.k_unMaxTrackedDeviceCount):
@@ -154,14 +128,13 @@ class OpenVRPublisher(Node):
         # Debug output
         # self.get_logger().info(f"Calibrated roll: {roll:.3f}, pitch: {pitch:.3f}, yaw: {joy_y:.3f}, throttle: {joy_x:.3f}")
 
-    def execute_single_click(self):
-        """Execute the single-click action (toggle arm) after delay"""
-        self.pending_single_click = False
+    def arm(self):
         self.arm_toggle = not self.arm_toggle   
         arm_msg = Bool()
         arm_msg.data = self.arm_toggle
         self.arm_pub.publish(arm_msg)
         self.get_logger().info(f"Arm toggled: {self.arm_toggle}")
+
 
     def timer_callback(self):
         poses, _ = openvr.VRCompositor().waitGetPoses(self.poses, None)
@@ -179,21 +152,32 @@ class OpenVRPublisher(Node):
         if res:
             r3_pressed = bool(state.ulButtonPressed & (1 << 32))
             a_pressed = bool(state.ulButtonPressed & (1 << 7))
-            b_pressed = bool(state.ulButtonPressed & (1 << 12))
-            current_time = self.get_clock().now().nanoseconds / 1e9
-
-            # if a_pressed and not self.last_a_state:
-            #     # self.lock_toggle = not self.lock_toggle
-            #     # lock_msg = Bool()
-            #     # lock_msg.data = self.lock_toggle
-            #     # self.lockpoint_pub.publish(lock_msg)
-            #     # if self.lock_toggle:
-            #     #     self.get_logger().info("Lock point set.")
-            #     # else:
-            #     #     self.get_logger().info("Lock point released.")
+            b_pressed = bool(state.ulButtonPressed & (1 << 1))
+            trigger = bool(state.ulButtonPressed & (1 << 33))
 
             if a_pressed and not self.last_a_state:
+                if self.follow_toggle:
+                    self.get_logger().warn("Folow mode is enabled, unable to enter lock mode.")
+                    return
+                
+                self.lock_toggle = not self.lock_toggle
+                lock_msg = Bool()
+                lock_msg.data = self.lock_toggle
+                self.lockpoint_pub.publish(lock_msg)
+                if self.lock_toggle:
+                    self.get_logger().info("Lock point set.")
+                else:
+                    self.get_logger().info("Lock point released.")
+
+            if b_pressed and not self.last_b_state:
+                if self.lock_toggle:
+                    self.get_logger().warn("Lock mode is enabled, unable to enter follow mode.")
+                    return
+                
                 self.follow_toggle = not self.follow_toggle
+                follow_msg = Bool()
+                follow_msg.data = self.follow_toggle
+                self.follow_mode_pub.publish(follow_msg)
                 if self.follow_toggle:
                     self.get_logger().info("Follow mode activated")
                 else:
@@ -202,35 +186,16 @@ class OpenVRPublisher(Node):
             
             # Detect rising edge (button just pressed)
             if r3_pressed and not self.last_r3_state:
-                time_since_last_click = current_time - self.last_click_time
-                
-                if time_since_last_click < self.double_click_threshold:
-                    # Double-click detected - recalibrate and cancel pending single click
-                    if self.pending_click_timer is not None:
-                        self.pending_click_timer.cancel()
-                        self.pending_click_timer = None
-                    self.pending_single_click = False
-                    
-                    self.calibration_offset = None
-                    self.get_logger().info("Double-click detected! Recalibrating...")
-                else:
-                    # Potential single click - schedule delayed action
-                    if self.pending_click_timer is not None:
-                        self.pending_click_timer.cancel()
-                    
-                    self.pending_single_click = True
-                    self.pending_click_timer = self.create_timer(
-                        self.double_click_threshold,
-                        self.execute_single_click
-                    )
-                    self.pending_click_timer._autostart = False
-                    self.pending_click_timer.reset()
-                
-                self.last_click_time = current_time
-            
+                self.arm()
+
+            if trigger and not self.last_trigger_state:
+                self.calibration_offset = None
+                self.get_logger().info("Trigger detected! Recalibrating...")
+
             self.last_r3_state = r3_pressed
             self.last_a_state = a_pressed
             self.last_b_state = b_pressed
+            self.last_trigger_state = trigger
 
                         
             thumbstick_x = state.rAxis[0].x
@@ -242,13 +207,12 @@ class OpenVRPublisher(Node):
         quat = self.matrix_to_quaternion(matrix)
 
         if self.follow_toggle:
-            follow_msg = BoolVector3()
-            follow_msg.flag = self.follow_toggle
+            follow_msg = Vector3()
             position = self.matrix_to_position(matrix)
 
-            follow_msg.vector.x = position[0]
-            follow_msg.vector.y = position[1]
-            follow_msg.vector.z = position[2]
+            follow_msg.x = position[0] * 2
+            follow_msg.y = position[2] * 2
+            follow_msg.z = -5.0
             self.followpoint_pub.publish(follow_msg)
 
         msg = Quaternion()
@@ -257,10 +221,6 @@ class OpenVRPublisher(Node):
         msg.z = quat[2]
         msg.w = quat[3]
         self.quat_to_euler(quat, joystick)
-
-        position = self.matrix_to_position(matrix)
-        self.publish_controller_marker(position)
-
 
 
 def main(args=None):
